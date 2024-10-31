@@ -1,62 +1,33 @@
-# Copyright 2022 DeepMind Technologies Limited
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#    http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-# ==============================================================================
-
-"""Utils for working with matrix multiplication tensor factorizations."""
-
-import gc
-import timeit
 from typing import Callable, List, Tuple
 
-import jax
-import jax.numpy as jnp
 import numpy as np
-import tree
-
-BlockMatrix = List[List[jnp.ndarray]]
 
 
-def block_split(matrix: jnp.ndarray, n_rows: int, n_cols: int) -> BlockMatrix:
-  """Splits `matrix` into a `n_rows x n_cols` block matrix."""
-  rows = jnp.split(matrix, n_rows, axis=0)
-  return [jnp.split(row, n_cols, axis=1) for row in rows]
+BlockMatrix = List[List[np.ndarray]]
 
+def _get_n_from_factors(factors: np.ndarray) -> int:
+  """Computes the matrix multiplication tensor size n based on `factors`.
 
-def get_matrix_multiplication_tensor(n: int) -> np.ndarray:
-  """Returns the matrix multiplication tensor T_n.
-
-  For n >= 1, T_n is a 3D tensor of shape [n*n, n*n, n*n] representing
-  - the bilinear operation (A, B) -> (AB)^T where A, B are two [n, n] matrices,
-  - or equivalently the trilinear operation (A, B, C) -> trace(ABC), where
-    A, B, C are three [n, n] matrices.
+  E.g. when multiplying 2x2 matrices with Strassen, the `factors` are of shape
+  [4, 7], and this function will return 2.
 
   Args:
-    n: Size of the matrix multiplication tensor to be returned.
+    factors: [3, n^2, R] shaped NumPy array representing a factorization of T_n.
   Returns:
-    NumPy array of shape [n^2, n^2, n^2] representing the tensor T_n.
+    n, the size of matrices being multiplied by the algorithm represented by
+    `factors`.
   """
-  result = np.full((n ** 2, n ** 2, n ** 2), 0, dtype=np.int32)
-  for i in range(n):
-    for j in range(n):
-      for k in range(n):
-        result[i * n  + j][j * n + k][k * n + i] = 1
-  return result
+  u, v, w = factors
+  # Assert that the tensor is a cube.
+  assert u.shape[0] == v.shape[0]
+  assert u.shape[0] == w.shape[0]
+  n = int(np.sqrt(u.shape[0]))
+  assert u.shape[0] == n ** 2
+  return n
 
 
-def algorithm_from_factors(
-    factors: np.ndarray) -> Callable[[BlockMatrix, BlockMatrix], BlockMatrix]:
-  """Returns a JAX function implementing the algorithm described by `factors`.
+def algorithm_from_factors(factors: np.ndarray) -> Callable[[BlockMatrix, BlockMatrix], BlockMatrix]:
+  """Returns a function implementing the algorithm described by `factors`.
 
   Args:
     factors: Matricized factorization of a matrix multiplication tensor, i.e.
@@ -115,119 +86,78 @@ def algorithm_from_factors(
 
   return f
 
-
-def _get_n_from_factors(factors: np.ndarray) -> int:
-  """Computes the matrix multiplication tensor size n based on `factors`.
-
-  E.g. when multiplying 2x2 matrices with Strassen, the `factors` are of shape
-  [4, 7], and this function will return 2.
-
-  Args:
-    factors: [3, n^2, R] shaped NumPy array representing a factorization of T_n.
-  Returns:
-    n, the size of matrices being multiplied by the algorithm represented by
-    `factors`.
-  """
-  u, v, w = factors
-  # Assert that the tensor is a cube.
-  assert u.shape[0] == v.shape[0]
-  assert u.shape[0] == w.shape[0]
-  n = int(np.sqrt(u.shape[0]))
-  assert u.shape[0] == n ** 2
-  return n
-
-
-def _generate_random_matrices(matrix_dims: Tuple[int, int, int],
-                              seed: int) -> Tuple[np.ndarray, np.ndarray]:
+def _generate_random_matrices(matrix_dims: Tuple[int, int, int],seed: int) -> Tuple[np.ndarray, np.ndarray]:
   """Generates two random NumPy matrices to be multiplied."""
   np.random.seed(seed)
   a = np.random.randn(matrix_dims[0], matrix_dims[1])
   b = np.random.randn(matrix_dims[1], matrix_dims[2])
   return a, b
 
+def _generate_random_int_matrices(matrix_dims: Tuple[int, int, int],seed: int) -> Tuple[np.ndarray, np.ndarray]:
+  """Generates two random NumPy matrices to be multiplied."""
+  np.random.seed(seed)
+  a = np.random.randint(1,256,(matrix_dims[0], matrix_dims[1]))
+  b = np.random.randint(1,256,(matrix_dims[1], matrix_dims[2]))
+  return a, b
 
-def _device_put(*arrays, dtype: jnp.dtype) -> ...:
-  """Converts NumPy arrays into JAX arrays and sends them to GPU."""
-  return tree.map_structure(
-      lambda x: jax.device_put(jnp.array(x).astype(dtype)), arrays)
+def block_split(matrix: np.ndarray, n_rows: int, n_cols: int) -> BlockMatrix:
+  """Splits `matrix` into a `n_rows x n_cols` block matrix."""
+  rows = np.split(matrix, n_rows, axis=0)
+  return [np.split(row, n_cols, axis=1) for row in rows]
 
+# takes n,m,p dimensions of two matrices multiplied together
+# returns numpy.ndarray
+def generate_naive_factorization(matrix_dims: Tuple[int, int, int]):
+    n,m,p = matrix_dims
+    multiplications = n * m *p
+    u = np.zeros(((n*m),multiplications ),dtype=np.int32)
+    v = np.zeros(((m*p),multiplications ),dtype=np.int32)
+    w = np.zeros(((n*p),multiplications ),dtype=np.int32)
+    
+    u_flat = u.flatten()
 
-def _get_baseline_op(matrix_dims: Tuple[int, int, int],
-                     dtype: jnp.dtype,
-                     n_repeat: int,
-                     seed: int) -> Callable[[], None]:
-  """Returns a function that applies `jnp.dot` `n_repeat` times."""
-  full_a, full_b = _generate_random_matrices(matrix_dims, seed=seed)
-  full_a, full_b = _device_put(full_a, full_b, dtype=dtype)
+    
+    multiplication_count =0
+    c_index = 0
+    #loop over matrix c row
+    for i in range(0,n):
+        for z in range(0,p):
+            for x in range(0,int(multiplications/(n*p))):
+                u[(z*m)+(x)][multiplication_count] = 1
+                v[i+(x*p)][multiplication_count]=1
+                w[c_index][multiplication_count] = 1
 
-  def _vanilla_single_timing() -> None:
-    c = full_b
-    for _ in range(n_repeat):
-      c = jnp.dot(full_a, c)
-    c.block_until_ready()
+                multiplication_count = multiplication_count + 1
+            c_index = c_index + 1
+    return np.stack((u,v,w),axis=0)
 
-  return _vanilla_single_timing
+def _get_2x2x2_strassen() -> np.ndarray:
+  """Returns [3, 4, 7] array, representing a rank-7 factorization of T_2."""
 
+  # List of 7 factors, each of shape [3, 4].
+  factors = [[[1, 0, 0, 1], [1, 0, 0, 1], [1, 0, 0, 1]],
+             [[1, 0, 0, 0], [0, 1, 0, -1], [0, 0, 1, 1]],
+             [[0, 1, 0, -1], [0, 0, 1, 1], [1, 0, 0, 0]],
+             [[0, 0, 1, 1], [1, 0, 0, 0], [0, 1, 0, -1]],
+             [[0, 0, 0, 1], [-1, 0, 1, 0], [1, 1, 0, 0]],
+             [[-1, 0, 1, 0], [1, 1, 0, 0], [0, 0, 0, 1]],
+             [[1, 1, 0, 0], [0, 0, 0, 1], [-1, 0, 1, 0]]]
 
-def _get_factorization_op(factors: np.ndarray,
-                          matrix_dims: Tuple[int, int, int],
-                          dtype: jnp.dtype,
-                          n_repeat: int,
-                          seed: int) -> Callable[[], None]:
-  """Returns an op that applies the `factors` algorithm `n_repeat` times."""
-  n = _get_n_from_factors(factors)
-  full_a, full_b = _generate_random_matrices(matrix_dims, seed=seed)
-  a = block_split(full_a, n, n)
-  b = block_split(full_b, n, n)
-  a, b = _device_put(a, b, dtype=dtype)
+  # Transpose into our standard format [3, S, R] = [3, 4, 7],
+  return np.transpose(np.array(factors, dtype=np.int32), [1, 2, 0])
 
-  jitted_algorithm = jax.jit(algorithm_from_factors(factors))
+def pad(array, reference_shape, offsets):
+    """
+    array: Array to be padded
+    reference_shape: tuple of size of ndarray to create
+    offsets: list of offsets (number of elements must be equal to the dimension of the array)
+    will throw a ValueError if offsets is too big and the reference_shape cannot handle the offsets
+    """
 
-  def _jitted_algorithm_timing() -> None:
-    c = b
-    for _ in range(n_repeat):
-      c = jitted_algorithm(a, c)
-    c[0][0].block_until_ready()
-
-  return _jitted_algorithm_timing
-
-
-def _benchmark_op(op: Callable[[], None], num_trials: int) -> List[float]:
-  """Benchmarks `op` `num_trials` times and returns all timings."""
-  # Warmup.
-  for _ in range(10):
-    op()
-
-  gc.disable()  # Prevent garbage collection from interfering with timings.
-  timings = []
-  for _ in range(num_trials):
-    s = timeit.default_timer()
-    op()
-    e = timeit.default_timer()
-    timings.append(e - s)
-  gc.enable()
-  return timings
-
-
-def benchmark_jnp_dot(matrix_dims: Tuple[int, int, int],
-                      num_trials: int,
-                      dtype: jnp.dtype = jnp.float32,
-                      average: int = 20,
-                      seed: int = 42) -> np.ndarray:
-  """Benchmarks `jnp.dot`."""
-  baseline_op = _get_baseline_op(matrix_dims, dtype, average, seed)
-  timings = _benchmark_op(baseline_op, num_trials)
-  return np.array(timings) / average
-
-
-def benchmark_factorized_algorithm(factors: np.ndarray,
-                                   matrix_dims: Tuple[int, int, int],
-                                   num_trials: int,
-                                   dtype: jnp.dtype = jnp.float32,
-                                   average: int = 20,
-                                   seed: int = 42) -> np.ndarray:
-  """Benchmarks the fast matrix multiplication algorithm given by `factors`."""
-  factorization_algorithm_op = _get_factorization_op(
-      factors, matrix_dims, dtype, average, seed)
-  timings = _benchmark_op(factorization_algorithm_op, num_trials)
-  return np.array(timings) / average
+    # Create an array of zeros with the reference shape
+    result = np.zeros(reference_shape,dtype=np.int32)
+    # Create a list of slices from offset to offset + shape in each dimension
+    insertHere = [slice(offsets[dim], offsets[dim] + array.shape[dim]) for dim in range(array.ndim)]
+    # Insert the array in the result at the specified offsets
+    result[tuple(insertHere)] = array
+    return result

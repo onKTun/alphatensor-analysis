@@ -1,7 +1,2 @@
-absl-py==1.2.0
-dm-tree==0.1.7
-jax
-jaxlib
 pandas
 numpy==1.21.6
-scipy==1.7.3

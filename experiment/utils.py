@@ -1,7 +1,8 @@
+# this utils file is composed of select modified functions from benchmarking/utils.py or the google-deepmind/alphatensor repo
+# the functions are modified for use with the experiment 
+
 from typing import Callable, List, Tuple
-
 import numpy as np
-
 
 BlockMatrix = List[List[np.ndarray]]
 
